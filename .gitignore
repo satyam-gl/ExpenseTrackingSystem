@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Personal data: logins, expense databases, backups, receipts
+data/
+*.db
+expenses.csv
