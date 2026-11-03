@@ -9,6 +9,7 @@ with daily backups next to it in backups/.
 import html
 import io
 import json
+import math
 import re
 import urllib.request
 from datetime import date, timedelta
@@ -590,9 +591,18 @@ def read_receipt(lines: list[str], df: pd.DataFrame) -> dict:
 
 def scan_receipt(upload, df: pd.DataFrame) -> None:
     """Fill in the Add expense form from an uploaded receipt, and keep the file to attach."""
-    with st.spinner("Reading the receipt…"):
-        lines = receipt_lines(upload.name, upload.getvalue())
-    st.session_state["scanned_id"] = upload.file_id
+    st.session_state["scanned_id"] = upload.file_id  # set first, so a file that fails isn't read on every rerun
+    # Forget the previous scan, so its file isn't attached if this one can't be read
+    st.session_state.pop("scanned_receipt", None)
+    st.session_state.pop("scan_category", None)
+    try:
+        with st.spinner("Reading the receipt…"):
+            lines = receipt_lines(upload.name, upload.getvalue())
+    except Exception:  # image and PDF libraries raise many kinds of errors for broken files
+        st.session_state["scan_result"] = (
+            "error", "Couldn't read this file. Is it a valid photo or PDF? You can still fill in the form yourself.", [],
+        )
+        return
     if lines is None:
         st.session_state["scan_result"] = (
             "error", "Receipt scanning isn't installed. Run: pip install rapidocr_onnxruntime pypdfium2", [],
@@ -628,15 +638,32 @@ def due_date(month: pd.Period, day: int) -> date:
     return date(month.year, month.month, min(day, month.days_in_month))
 
 
+def next_month(rule: dict) -> pd.Period | None:
+    """The month a rule is next due. A missing or broken one restarts from its next due date."""
+    try:
+        return pd.Period(rule["next"], "M") if isinstance(rule.get("next"), str) else None
+    except ValueError:
+        return None
+
+
+def before_end(rule: dict, month: pd.Period) -> bool:
+    """False after a rule's last month: loan EMIs stop once the loan is paid off."""
+    return not rule.get("until") or month <= pd.Period(rule["until"], "M")
+
+
 def apply_recurring(df: pd.DataFrame) -> pd.DataFrame:
     """Add every recurring expense that has come due since it was last added."""
     today = date.today()
     new_rows = []
+    repaired = False
     for rule in settings["recurring"]:
+        if next_month(rule) is None:
+            rule["next"] = first_due_month(rule["day"])
+            repaired = True
         if not rule["active"] or rule.get("mode") == "remind":
             continue
-        month = pd.Period(rule["next"], "M")
-        while due_date(month, rule["day"]) <= today:
+        month = next_month(rule)
+        while due_date(month, rule["day"]) <= today and before_end(rule, month):
             new_rows.append([
                 due_date(month, rule["day"]), rule["category"], rule["amount"],
                 rule.get("payment", "Other"), f"🔁 {rule['name']}", rule.get("account", ""),
@@ -645,6 +672,8 @@ def apply_recurring(df: pd.DataFrame) -> pd.DataFrame:
         rule["next"] = str(month)
 
     if not new_rows:
+        if repaired:
+            save_settings(settings)
         return df
     save_data(pd.concat([df, pd.DataFrame(new_rows, columns=COLUMNS)], ignore_index=True))
     save_settings(settings)
@@ -657,7 +686,7 @@ def upcoming_bills() -> list[tuple[int, dict, date]]:
     horizon = date.today() + timedelta(days=BILL_NOTICE_DAYS)
     bills = []
     for i, rule in enumerate(settings["recurring"]):
-        if rule["active"] and rule.get("mode") == "remind":
+        if rule["active"] and rule.get("mode") == "remind" and before_end(rule, pd.Period(rule["next"], "M")):
             due = due_date(pd.Period(rule["next"], "M"), rule["day"])
             if due <= horizon:
                 bills.append((i, rule, due))
@@ -710,6 +739,12 @@ def find_subscriptions(df: pd.DataFrame) -> list[dict]:
         if streak < SUBSCRIPTION_MIN_CHARGES:
             continue
         recent = rows.tail(streak)
+        day = int(pd.Series([d.day for d in recent["Date"]]).median())
+        # The first due date a month after the last charge, so it isn't charged twice. Going by the calendar
+        # month alone fails when a charge comes early: a day-1 charge on 31 Oct was November's.
+        month = pd.Period(last["Date"], "M")
+        while due_date(month, day) < last["Date"] + timedelta(days=MONTHLY_GAP_DAYS[0]):
+            month += 1
         found.append({
             "shop": shop,
             "months": streak,
@@ -721,10 +756,9 @@ def find_subscriptions(df: pd.DataFrame) -> list[dict]:
                 "payment": last["Payment"] if last["Payment"] in PAYMENT_METHODS else "Other",
                 "account": last["Account"] if last["Account"] in ACCOUNTS else "",
                 "mode": "auto",
-                "day": int(pd.Series([d.day for d in recent["Date"]]).median()),
+                "day": day,
                 "active": True,
-                # The month after the last charge, so this month's charge isn't added twice
-                "next": str(pd.Period(last["Date"], "M") + 1),
+                "next": str(month),
             },
         })
     return sorted(found, key=lambda s: -s["rule"]["amount"])
@@ -1138,6 +1172,11 @@ def render_alerts(df: pd.DataFrame) -> None:
                 dismiss_alert(key)
 
 
+def current_or_before(newest_first: list, current) -> int:
+    """Where a picker should start: the current period, or the latest one before it (not a future one)."""
+    return next((i for i, option in enumerate(newest_first) if option <= current), 0)
+
+
 def render_dashboard(df: pd.DataFrame) -> None:
     if df.empty:
         st.info("No expenses yet. Add your first one from the sidebar 👈")
@@ -1151,7 +1190,8 @@ def render_dashboard(df: pd.DataFrame) -> None:
     df = df.assign(Month=pd.to_datetime(df["Date"]).dt.to_period("M").astype(str))
     months = sorted(df["Month"].unique(), reverse=True)
     pick_col, report_col = st.columns([4, 1], vertical_alignment="bottom")
-    selected_month = pick_col.selectbox("Month", months, index=0)
+    this_month = str(pd.Period(date.today(), "M"))
+    selected_month = pick_col.selectbox("Month", months, index=current_or_before(months, this_month))
     month_df = df[df["Month"] == selected_month]
 
     prev_month = str(pd.Period(selected_month, "M") - 1)
@@ -1463,11 +1503,14 @@ def render_settings(df: pd.DataFrame) -> None:
     )
     original = pd.DataFrame(settings["categories"], columns=["icon", "name", "budget"])
     original["budget"] = original["budget"].fillna(0).astype(int)
+    # Each category's saved name, hidden: rows are matched by it, since an added row can reuse a deleted row's index
+    original["was"] = original["name"]
     edited = st.data_editor(
         original,
         num_rows="dynamic",
         hide_index=True,
         column_config={
+            "was": None,
             "icon": st.column_config.TextColumn("Icon", width="small", max_chars=2),
             "name": st.column_config.TextColumn("Name", required=True),
             "budget": st.column_config.NumberColumn(
@@ -1486,13 +1529,11 @@ def render_settings(df: pd.DataFrame) -> None:
     edited = edited[edited["name"] != ""]
     names = list(edited["name"])
 
-    # Rows kept from the original table keep their index, so a changed name is a rename
-    renames = {
-        original.at[i, "name"]: edited.at[i, "name"]
-        for i in original.index.intersection(edited.index)
-        if original.at[i, "name"] != edited.at[i, "name"]
-    }
-    removed = set(original["name"]) - set(renames) - set(names)
+    # Rows kept from the original table still have their saved name, so a changed name is a rename
+    still_there = edited[edited["was"] != ""]  # added rows have none (emptied by fillna above)
+    renames = {was: name for was, name in zip(still_there["was"], still_there["name"]) if was != name}
+    # A name typed again in an added row is kept; one taken over by renaming another row is still removed
+    removed = set(original["name"]) - set(still_there["was"]) - set(edited.loc[edited["was"] == "", "name"])
     in_use = df["Category"].value_counts()
     in_recurring = {r["category"] for r in settings["recurring"]}
 
@@ -1615,9 +1656,39 @@ def render_income(df: pd.DataFrame) -> None:
 
 
 # ---------- Import tab ----------
+def parse_amount(text) -> float | None:
+    """'₹1,250.00', 'Rs. 500', '-40', '300 Dr', '1,250.00-', '(250.00)' -> numbers. Dr and a minus or brackets
+    mean money out (negative), Cr means money in. None if it isn't an amount."""
+    s = str(text).strip().lower() if pd.notna(text) else ""
+    negative = False
+    if s.startswith("(") and s.endswith(")"):
+        negative, s = True, s[1:-1]
+    s = re.sub(r"₹|\b(?:rs|inr)\b\.?", "", s).strip()
+    if marker := re.search(r"\s*\b(dr|cr)\b\.?$", s):
+        negative |= marker[1] == "dr"
+        s = s[:marker.start()]
+    s = s.replace(",", "").replace(" ", "")
+    if s.endswith("-"):
+        negative, s = True, s[:-1]
+    if s.startswith(("-", "+")):
+        negative |= s[0] == "-"
+        s = s[1:]
+    if not re.fullmatch(r"\d+(?:\.\d+)?|\.\d+", s):
+        return None
+    return -float(s) if negative else float(s)
+
+
 def parse_amounts(values: pd.Series) -> pd.Series:
-    """'₹1,250.00', '-40', ' 300 Dr' -> numbers; blanks become NaN."""
-    return pd.to_numeric(values.fillna("").str.replace(r"[^\d.\-]", "", regex=True), errors="coerce")
+    return values.map(parse_amount).astype(float)
+
+
+def parse_dates(values: pd.Series) -> pd.Series:
+    """Statement dates: day first (05/10/2026 is 5 Oct), except year-first ones like 2026-10-05."""
+    year_first = values.fillna("").str.match(r"\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
+    dates = pd.to_datetime(values.where(~year_first), dayfirst=True, errors="coerce", format="mixed")
+    if year_first.any():
+        dates[year_first] = pd.to_datetime(values[year_first], errors="coerce", format="mixed")
+    return dates
 
 
 def render_import(df: pd.DataFrame) -> None:
@@ -1657,7 +1728,17 @@ def render_import(df: pd.DataFrame) -> None:
     )
 
     amounts = parse_amounts(stmt[amount_col])
-    dates = pd.to_datetime(stmt[date_col], dayfirst=True, errors="coerce", format="mixed")
+    dates = parse_dates(stmt[date_col])
+    # A blank amount is normal (e.g. a credit row in a separate debit column); one that can't be read isn't
+    has_amount = stmt[amount_col].fillna("").str.strip() != ""
+    unreadable = has_amount & (amounts.isna() | dates.isna())
+    if unreadable.any():
+        lines = [str(i + 2) for i in stmt.index[unreadable]]  # +2: the header is line 1
+        st.warning(
+            f"Skipped {len(lines)} row{'s' if len(lines) != 1 else ''} whose date or amount couldn't be read "
+            f"(line{'s' if len(lines) != 1 else ''} {', '.join(lines[:10])}{'…' if len(lines) > 10 else ''}). "
+            "Check those rows, or add them by hand."
+        )
     keep = dates.notna() & amounts.notna() & (amounts != 0)
     if spending == "Negative amounts":
         keep &= amounts < 0
@@ -1725,6 +1806,13 @@ def render_import(df: pd.DataFrame) -> None:
 
     chosen = edited[edited["Import"]]
     if st.button(f"📥 Import {len(chosen)} expenses", type="primary", disabled=chosen.empty):
+        incomplete = chosen["Date"].isna() | chosen["Amount"].isna() | (chosen["Amount"] <= 0)
+        if incomplete.any():
+            st.error(
+                f"{incomplete.sum()} ticked row{'s are' if incomplete.sum() != 1 else ' is'} missing a date or amount. "
+                "Fill them in or untick them, then import again."
+            )
+            return
         save_data(pd.concat([df, chosen[COLUMNS]], ignore_index=True))
         # Categories you changed from the guess are remembered for those shops
         fixed = chosen[chosen["Category"] != preview.loc[chosen.index, "Category"]]
@@ -1804,6 +1892,7 @@ def render_recurring() -> None:
         return
 
     rules, problems = [], []
+    ends = {rule["name"]: rule["until"] for rule in settings["recurring"] if rule.get("until")}  # not in the table
     for row_no, (i, r) in enumerate(edited.iterrows(), start=1):
         name = str(r["name"]).strip() if pd.notna(r["name"]) else ""
         if not name and pd.isna(r["amount"]):
@@ -1814,7 +1903,9 @@ def render_recurring() -> None:
             continue
         day = int(r["day"])
         active = bool(r["active"]) if pd.notna(r["active"]) else True
-        is_new = i not in original.index
+        # A table row added next to a deleted one can reuse its index, so tell new rows apart by their
+        # "next" month: it's read-only, so only rows that were never saved have none
+        is_new = i not in original.index or not isinstance(r["next"], str) or not r["next"]
         resumed = not is_new and active and not original.at[i, "active"]
         rules.append({
             "name": name,
@@ -1827,6 +1918,7 @@ def render_recurring() -> None:
             "active": active,
             # New or resumed rules start from their next due date, so nothing is back-filled
             "next": first_due_month(day) if is_new or resumed else r["next"],
+            **({"until": ends[name]} if name in ends else {}),
         })
 
     if problems:
@@ -1864,8 +1956,9 @@ def render_year(df: pd.DataFrame) -> None:
         return dates.dt.year - (dates.dt.month < 4) if financial else dates.dt.year
 
     years = sorted(set(year_of(df["Date"])) | set(year_of(income["Date"])), reverse=True)
+    this_year = int(year_of(pd.Series([date.today()])).iat[0])
     year = st.selectbox(
-        "Year", years, key="year_pick",
+        "Year", years, key="year_pick", index=current_or_before(years, this_year),
         format_func=lambda y: f"FY {y}-{str(y + 1)[-2:]}" if financial else str(y),
     )
     start = date(year, 4, 1) if financial else date(year, 1, 1)
@@ -2027,11 +2120,14 @@ def render_goals() -> None:
     st.caption("Removing a goal also removes the money recorded against it.")
     original = pd.DataFrame(settings["goals"], columns=["icon", "name", "target", "deadline"])
     original["deadline"] = pd.to_datetime(original["deadline"]).dt.date
+    # Each goal's saved name, hidden: rows are matched by it, since an added row can reuse a deleted row's index
+    original["was"] = original["name"]
     edited = st.data_editor(
         original,
         num_rows="dynamic",
         hide_index=True,
         column_config={
+            "was": None,
             "icon": st.column_config.TextColumn("Icon", width="small", max_chars=2, default="🎯"),
             "name": st.column_config.TextColumn("Goal", required=True),
             "target": st.column_config.NumberColumn(f"Target ({CURRENCY})", min_value=1, format="%.0f", required=True),
@@ -2050,13 +2146,11 @@ def render_goals() -> None:
     if edited["target"].isna().any():
         st.error("Every goal needs a target amount.")
         return
-    renames = {
-        original.at[i, "name"]: edited.at[i, "name"]
-        for i in original.index.intersection(edited.index)
-        if original.at[i, "name"] != edited.at[i, "name"]
-    }
-    kept = contributions.assign(Goal=contributions["Goal"].replace(renames))
-    store.save("contributions", kept[kept["Goal"].isin(edited["name"])])
+    # Money stays with the goal it was saved for: removed goals lose theirs, renamed ones take it along
+    still_there = edited.dropna(subset=["was"])
+    renames = dict(zip(still_there["was"], still_there["name"]))
+    kept = contributions[contributions["Goal"].isin(renames)]
+    store.save("contributions", kept.assign(Goal=kept["Goal"].map(renames)))
     settings["goals"] = [
         {
             "icon": (r["icon"] or "🎯") if pd.notna(r["icon"]) else "🎯",
@@ -2105,20 +2199,21 @@ def render_splits() -> None:
             st.error(f"{payer} isn't in the 'Shared with' list.")
         else:
             share = round(total / (len(people) + 1), 2)
+            mine = round(total - share * len(people), 2)  # the leftover paisa is yours, so the shares add up
             text = note or "Split bill"
             expense_id = store.add("expenses", {
-                "Date": when, "Category": category, "Amount": share,
+                "Date": when, "Category": category, "Amount": mine,
                 "Payment": "Other",
                 "Note": f"{text} (your share of {money(total)})", "Account": "",
             })
             # You paid: everyone else owes you their share. A friend paid: you owe them yours.
-            owed = [(p, share) for p in people] if paid_by_me else [(payer, -share)]
+            owed = [(p, share) for p in people] if paid_by_me else [(payer, -mine)]
             for person, amount in owed:
                 store.add("splits", {
                     "Date": when, "Person": person, "Amount": amount, "Note": text,
                     "Settled": 0, "ExpenseId": expense_id,
                 })
-            flash(f"Split {money(total)} {len(people) + 1} ways: your share is {money(share)}")
+            flash(f"Split {money(total)} {len(people) + 1} ways: your share is {money(mine)}")
 
     open_splits = splits[~splits["Settled"]]
     if splits.empty:
@@ -2221,7 +2316,7 @@ def cash_forecast(df: pd.DataFrame, days: int) -> tuple[pd.DataFrame, pd.DataFra
     for rule in settings["recurring"]:
         if rule["active"]:
             month = pd.Period(rule["next"], "M")
-            while (due := due_date(month, rule["day"])) <= end:
+            while (due := due_date(month, rule["day"])) <= end and before_end(rule, month):
                 add(due, rule.get("account", ""), f"🔁 {rule['name']}", -rule["amount"])
                 month += 1
 
@@ -2408,11 +2503,14 @@ def render_accounts(df: pd.DataFrame) -> None:
 
     st.subheader("Your accounts")
     original = pd.DataFrame(settings["accounts"], columns=["name", "type", "opening"])
+    # Each account's saved name, hidden: rows are matched by it, since an added row can reuse a deleted row's index
+    original["was"] = original["name"]
     edited = st.data_editor(
         original,
         num_rows="dynamic",
         hide_index=True,
         column_config={
+            "was": None,
             "name": st.column_config.TextColumn("Name", required=True),
             "type": st.column_config.SelectboxColumn("Type", options=ACCOUNT_TYPES, default="Bank", required=True),
             "opening": st.column_config.NumberColumn(
@@ -2428,21 +2526,20 @@ def render_accounts(df: pd.DataFrame) -> None:
     edited["name"] = edited["name"].fillna("").astype(str).str.strip()
     edited = edited[edited["name"] != ""]
     names = list(edited["name"])
-    renames = {
-        original.at[i, "name"]: edited.at[i, "name"]
-        for i in original.index.intersection(edited.index)
-        if original.at[i, "name"] != edited.at[i, "name"]
-    }
-    removed = set(original["name"]) - set(renames) - set(names)
+    still_there = edited.dropna(subset=["was"])
+    renames = {was: name for was, name in zip(still_there["was"], still_there["name"]) if was != name}
+    # A name typed again in an added row is kept; one taken over by renaming another row is still removed
+    removed = set(original["name"]) - set(still_there["was"]) - set(edited.loc[edited["was"].isna(), "name"])
     used = (
         set(df["Account"]) | set(income["Account"]) | set(transfers["From"]) | set(transfers["To"])
         | {r.get("account", "") for r in settings["recurring"]}
+        | {loan.get("account", "") for loan in settings["loans"]}
     )
     if len(set(names)) != len(names):
         st.error("Account names must be unique.")
     elif blocked := sorted(removed & used):
         st.error(
-            "These accounts still have transactions, so they can't be removed: "
+            "These accounts still have transactions or loans paid from them, so they can't be removed: "
             + ", ".join(blocked) + ". Rename them instead."
         )
     else:
@@ -2454,6 +2551,11 @@ def render_accounts(df: pd.DataFrame) -> None:
             ))
             for rule in settings["recurring"]:
                 rule["account"] = renames.get(rule.get("account", ""), rule.get("account", ""))
+            for loan in settings["loans"]:
+                loan["account"] = renames.get(loan.get("account", ""), loan.get("account", ""))
+        settings["main_account"] = (
+            None if settings["main_account"] in removed else renames.get(settings["main_account"], settings["main_account"])
+        )
         settings["accounts"] = [
             {"name": r["name"], "type": r["type"] if r["type"] in ACCOUNT_TYPES else "Bank",
              "opening": float(r["opening"]) if pd.notna(r["opening"]) else 0.0}
@@ -2481,40 +2583,76 @@ def emi_rule_name(loan: dict) -> str:
     return f"EMI {loan['name']}"
 
 
+def sync_emi_rules() -> bool:
+    """Set each loan's EMI rule in Recurring to stop after the loan's last EMI. True if any changed."""
+    changed = False
+    for loan in settings["loans"]:
+        schedule = loan_schedule(loan)
+        if schedule is None:  # never paid off, so no end
+            until = None
+        else:
+            emis = schedule.loc[schedule["EMI"] > 0, "Date"]
+            # Paid off before its first EMI: end the month before
+            last = pd.Period(emis.iat[-1], "M") if not emis.empty else pd.Period(loan["first_emi"], "M") - 1
+            until = str(last)
+        for rule in settings["recurring"]:
+            if rule["name"] == emi_rule_name(loan) and rule.get("until") != until:
+                rule["until"] = until
+                changed = True
+    return changed
+
+
 def loan_schedule(loan: dict, extra_monthly: float = 0.0, lump_sum: float = 0.0) -> pd.DataFrame | None:
     """Month-by-month repayment: Date, EMI, Interest, Principal, Extra, Balance.
 
-    Recorded prepayments come off after the EMI they fall before. `extra_monthly` and `lump_sum`
-    are what-ifs starting from the next EMI. None if the EMI never pays the loan off.
+    Recorded prepayments come off before the EMI they fall before; one that clears the loan ends it
+    on its own date, with no EMI. `extra_monthly` and `lump_sum` are what-ifs starting from the next EMI.
+    None if the EMI never pays the loan off (see `never_repaid`) or it takes over MAX_LOAN_MONTHS.
     """
     r = loan["rate"] / 1200
     first, today = date.fromisoformat(loan["first_emi"]), date.today()
     prepayments = [(date.fromisoformat(p["date"]), p["amount"]) for p in loan.get("prepayments", [])]
     balance, previous, rows = float(loan["principal"]), date.min, []
+    columns = ["Date", "EMI", "Interest", "Principal", "Extra", "Balance"]
+    if never_repaid(loan):
+        return None
     for n in range(MAX_LOAN_MONTHS):
         due = due_date(pd.Period(first, "M") + n, first.day)
-        interest = balance * r
-        if loan["emi"] <= interest:
-            return None
-        emi = min(loan["emi"], balance + interest)
-        balance -= emi - interest
-        extra = sum(amount for when, amount in prepayments if previous < when <= due)
+        paid_early = [(when, amount) for when, amount in prepayments if previous < when <= due]
+        extra = sum(amount for _, amount in paid_early)
         if due > today:
             extra += extra_monthly + (lump_sum if not any(row[0] > today for row in rows) else 0)
         extra = min(extra, balance)
         balance -= extra
+        if balance < 0.5:  # prepaid in full before this EMI
+            rows.append((max((when for when, _ in paid_early), default=due), 0.0, 0.0, 0.0, extra, 0.0))
+            return pd.DataFrame(rows, columns=columns)
+        interest = balance * r
+        emi = min(loan["emi"], balance + interest)
+        balance -= emi - interest
+        if balance < loan["emi"] / 100:  # a rounding leftover goes on this EMI, not a tiny extra one
+            emi, balance = emi + balance, 0.0
         rows.append((due, emi, interest, emi - interest, extra, balance))
         previous = due
         if balance < 0.5:
-            return pd.DataFrame(rows, columns=["Date", "EMI", "Interest", "Principal", "Extra", "Balance"])
+            return pd.DataFrame(rows, columns=columns)
     return None
+
+
+def never_repaid(loan: dict) -> bool:
+    """The EMI doesn't even cover the first month's interest (the most it ever is), so the loan only grows."""
+    return loan["emi"] <= loan["principal"] * loan["rate"] / 1200
 
 
 def loan_status(loan: dict, schedule: pd.DataFrame) -> dict:
     today = date.today()
     paid, ahead = schedule[schedule["Date"] <= today], schedule[schedule["Date"] > today]
+    left = paid["Balance"].iat[-1] if not paid.empty else float(loan["principal"])
+    # The schedule takes a prepayment off at the next EMI, but it's already paid
+    since = paid["Date"].iat[-1] if not paid.empty else date.min
+    left -= sum(p["amount"] for p in loan.get("prepayments", []) if since < date.fromisoformat(p["date"]) <= today)
     return {
-        "left": paid["Balance"].iat[-1] if not paid.empty else float(loan["principal"]),
+        "left": max(left, 0.0),
         "emis_left": len(ahead),
         "payoff": schedule["Date"].iat[-1],
         "interest_left": ahead["Interest"].sum(),
@@ -2538,10 +2676,16 @@ def render_loan(index: int, loan: dict) -> None:
     schedule = loan_schedule(loan)
     title = f"{LOAN_TYPES.get(loan['type'], '📄')} **{loan['name']}** · {money(loan['emi'])} a month"
     if schedule is None:
-        st.error(
-            f"{title}: the EMI doesn't cover the interest ({money(loan['principal'] * loan['rate'] / 1200)} "
-            "a month at the start), so this loan would never be paid off. Check the amount, rate and EMI below."
-        )
+        if never_repaid(loan):
+            st.error(
+                f"{title}: the EMI doesn't cover the interest ({money(loan['principal'] * loan['rate'] / 1200)} "
+                "a month at the start), so this loan would never be paid off. Check the amount, rate and EMI below."
+            )
+        else:
+            st.error(
+                f"{title}: at this EMI the loan would take over {MAX_LOAN_MONTHS // 12} years to pay off. "
+                "Check the amount, rate and EMI below."
+            )
         return
     status = loan_status(loan, schedule)
     repaid = 1 - status["left"] / loan["principal"] if loan["principal"] else 1
@@ -2594,6 +2738,7 @@ def render_loan(index: int, loan: dict) -> None:
                         st.error("Enter an amount greater than 0.")
                     else:
                         loan.setdefault("prepayments", []).append({"date": when.isoformat(), "amount": amount})
+                        sync_emi_rules()
                         save_settings(settings)
                         flash(f"Prepayment of {money(amount)} saved for {loan['name']}")
             for p in loan.get("prepayments", []):
@@ -2608,6 +2753,7 @@ def render_loan(index: int, loan: dict) -> None:
                 "payment": "Net banking", "account": loan.get("account", ""), "mode": "auto",
                 "day": first.day, "active": True, "next": str(max(pd.Period(first, "M"), pd.Period(first_due_month(first.day), "M"))),
             }]
+            sync_emi_rules()
             save_settings(settings)
             flash(f"{emi_rule_name(loan)} added to Recurring")
 
@@ -2618,6 +2764,8 @@ def render_loans() -> None:
         "Interest is worked out monthly like a standard EMI, so it can differ from your bank's figures by a little."
     )
     loans = settings["loans"]
+    if sync_emi_rules():  # EMI rules made before they had an end month
+        save_settings(settings)
     statuses = [(loan, loan_schedule(loan)) for loan in loans]
     active = [(loan, loan_status(loan, s)) for loan, s in statuses if s is not None]
     active = [(loan, s) for loan, s in active if s["left"] >= 0.5]
@@ -2644,12 +2792,15 @@ def render_loans() -> None:
     original = pd.DataFrame(loans, columns=["name", "type", "principal", "rate", "tenure", "emi", "first_emi", "account"])
     original["first_emi"] = pd.to_datetime(original["first_emi"]).dt.date
     original["account"] = original["account"].astype(object).fillna("")
+    # Each loan's saved position, hidden: rows are matched by it, since an added row can reuse a deleted row's index
+    original["was"] = range(len(original))
     edited = st.data_editor(
         original,
         num_rows="dynamic",
         hide_index=True,
         width="stretch",
         column_config={
+            "was": None,
             "name": st.column_config.TextColumn("Name", required=True),
             "type": st.column_config.SelectboxColumn("Type", options=list(LOAN_TYPES), default="Personal", required=True),
             "principal": st.column_config.NumberColumn(f"Borrowed ({CURRENCY})", min_value=0, format="%.0f", required=True),
@@ -2665,7 +2816,7 @@ def render_loans() -> None:
         return
 
     saved, problems = [], []
-    for row_no, (i, r) in enumerate(edited.iterrows(), start=1):
+    for row_no, (_, r) in enumerate(edited.iterrows(), start=1):
         name = str(r["name"]).strip() if pd.notna(r["name"]) else ""
         if not name and pd.isna(r["principal"]):
             continue  # blank row
@@ -2675,14 +2826,15 @@ def render_loans() -> None:
                 or pd.isna(r["first_emi"]) or not (emi or tenure):
             problems.append(f"row {row_no}")
             continue
-        old = loans[i] if i in original.index else {}
+        old = loans[int(r["was"])] if pd.notna(r["was"]) else {}
         saved.append({
             "name": name,
             "type": r["type"] if r["type"] in LOAN_TYPES else "Other",
             "principal": float(r["principal"]),
             "rate": float(r["rate"]),
             "tenure": tenure,
-            "emi": round(float(emi or emi_for(r["principal"], r["rate"], tenure)), 2),
+            # A worked-out EMI is rounded up to the paisa, so it pays the loan off within the tenure
+            "emi": round(float(emi), 2) if emi else math.ceil(emi_for(r["principal"], r["rate"], tenure) * 100) / 100,
             "first_emi": pd.Timestamp(r["first_emi"]).date().isoformat(),
             "account": r["account"] if r["account"] in ACCOUNTS else "",
             "prepayments": old.get("prepayments", []),
@@ -2702,6 +2854,7 @@ def render_loans() -> None:
         st.error("Loan names must be unique.")
     else:
         settings["loans"] = saved
+        sync_emi_rules()
         save_settings(settings)
         flash("Loans saved")
 
@@ -2738,7 +2891,8 @@ def net_worth_history(df: pd.DataFrame, with_goals: bool) -> pd.DataFrame:
     assets = [(a["value"], date.fromisoformat(a["since"]) if a.get("since") else date.min) for a in settings["assets"]]
     starts += [since for _, since in assets if since != date.min]
     current = pd.Period(today, "M")
-    first = max(pd.Period(min(starts, default=today), "M"), current - (NET_WORTH_MONTHS - 1))
+    # Today is included so a loan or asset that starts in a future month still leaves this month to show
+    first = max(pd.Period(min([*starts, today]), "M"), current - (NET_WORTH_MONTHS - 1))
 
     rows = []
     for month in pd.period_range(first, current, freq="M"):

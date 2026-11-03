@@ -232,7 +232,11 @@ class Store:
 
 
 # ---------- User accounts ----------
-USERNAME_PATTERN = re.compile(r"^[a-z0-9_.-]{3,30}$")
+# Starts and ends with a letter or number: Windows drops trailing dots from folder names,
+# so "abc." would share "abc"'s data folder
+USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,28}[a-z0-9]$")
+# Device names Windows won't use as folder names, even with an extension ("nul.x")
+RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(10)), *(f"lpt{i}" for i in range(10))}
 MIN_PASSWORD_LENGTH = 8
 HASH_ITERATIONS = 200_000
 
@@ -267,7 +271,12 @@ class Users:
     def create(self, username: str, password: str) -> str | None:
         """Add a user. Returns an error message, or None on success."""
         if not USERNAME_PATTERN.match(username):
-            return "Usernames are 3–30 characters: lowercase letters, numbers, dots, dashes or underscores."
+            return (
+                "Usernames are 3–30 characters: lowercase letters, numbers, dots, dashes or underscores, "
+                "starting and ending with a letter or number."
+            )
+        if username.split(".")[0] in RESERVED_NAMES:
+            return "That username can't be used. Please choose another."
         if len(password) < MIN_PASSWORD_LENGTH:
             return f"Passwords need at least {MIN_PASSWORD_LENGTH} characters."
         salt = os.urandom(16)
