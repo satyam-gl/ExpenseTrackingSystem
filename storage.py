@@ -141,11 +141,17 @@ class Store:
         self.prune_receipts()
 
     def prune_receipts(self) -> None:
-        """Delete receipt files that no expense refers to any more."""
+        """Delete receipt files that no expense refers to any more, now or in a kept backup
+        (so restoring a backup brings its receipts back too)."""
         if not self.receipts_dir.exists():
             return
-        with closing(self._connect()) as con:
-            in_use = {row[0] for row in con.execute("SELECT Receipt FROM expenses WHERE Receipt != ''")}
+        in_use = set()
+        for db in [self.db_path, *self.list_backups()]:
+            try:
+                with closing(sqlite3.connect(db)) as con:
+                    in_use |= {row[0] for row in con.execute("SELECT Receipt FROM expenses WHERE Receipt != ''")}
+            except sqlite3.Error:  # an old backup from before receipts existed, or a damaged one
+                continue
         for path in self.receipts_dir.iterdir():
             if path.name not in in_use:
                 path.unlink()
@@ -201,6 +207,10 @@ class Store:
         self.backup_dir.mkdir(exist_ok=True)
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         target = self.backup_dir / f"{self.db_path.stem}_{stamp}{'_' + label if label else ''}.db"
+        n = 2
+        while target.exists():  # two backups in the same second: don't overwrite the first
+            target = self.backup_dir / f"{self.db_path.stem}_{stamp}-{n}{'_' + label if label else ''}.db"
+            n += 1
         with closing(self._connect()) as src, closing(sqlite3.connect(target)) as dst:
             src.backup(dst)
         self._prune_backups()
@@ -220,8 +230,11 @@ class Store:
 
     def _prune_backups(self) -> None:
         # Only automatic backups are pruned; ones made by hand are kept
-        for old in [p for p in self.list_backups() if p.stem.endswith("_auto")][KEEP_BACKUPS:]:
-            old.unlink()
+        old = [p for p in self.list_backups() if p.stem.endswith("_auto")][KEEP_BACKUPS:]
+        for path in old:
+            path.unlink()
+        if old:
+            self.prune_receipts()  # receipts only those backups needed
 
     def restore(self, backup: Path) -> None:
         """Replace the database with a backup, saving the current state first."""

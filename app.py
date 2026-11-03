@@ -312,13 +312,19 @@ QUICK_PAYMENT_WORDS = {
 }
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+# Whole month names or their short forms, so "marina" isn't March
+MONTH_WORDS = "|".join(sorted(
+    {*MONTHS, "january", "february", "march", "april", "june", "july", "august", "september", "sept", "october",
+     "november", "december"}, key=len, reverse=True,
+))
 QUICK_CURRENCY_SYMBOLS = {
     "US$": "USD", "S$": "SGD", "A$": "AUD", "C$": "CAD", "HK$": "HKD", "NZ$": "NZD", "$": "USD", "€": "EUR",
     "£": "GBP", "¥": "JPY", "฿": "THB", "₩": "KRW",
 }
 QUICK_CURRENCY_WORDS = {
     **{code.lower(): code for code in FOREIGN_CURRENCIES},
-    "dollar": "USD", "dollars": "USD", "euro": "EUR", "euros": "EUR", "pound": "GBP", "pounds": "GBP",
+    # Not "pound": "450 pound cake" is cake. "40 pounds", "£40" and "40 gbp" still work.
+    "dollar": "USD", "dollars": "USD", "euro": "EUR", "euros": "EUR", "pounds": "GBP",
     "dirham": "AED", "dirhams": "AED", "baht": "THB", "yen": "JPY", "ringgit": "MYR", "riyal": "SAR",
     "riyals": "SAR",
 }
@@ -350,18 +356,20 @@ def _quick_date(text: str, today: date) -> tuple[date | None, str]:
         return today, m[1]
     if (m := _take(r"\b(\d{1,2}) days? ago\b", text))[0]:
         return today - timedelta(days=int(m[0][1])), m[1]
-    days = "|".join(f"{d}|{d[:3]}" for d in WEEKDAYS)
-    if (m := _take(rf"\b({days})\b", text))[0]:
-        weekday = next(i for i, d in enumerate(WEEKDAYS) if d.startswith(m[0][1].lower()[:3]))
+    # Full weekday names anywhere; short ones only last or after "on"/"last", so "sun pharma" isn't a Sunday
+    full = "|".join(WEEKDAYS)
+    short = "|".join(d[:3] for d in WEEKDAYS)
+    if (m := _take(rf"\b({full})\b|(?:\b(?:on|last)\s+)\b({short})\b|\b({short})\s*$", text))[0]:
+        typed = next(g for g in m[0].groups() if g)
+        weekday = next(i for i, d in enumerate(WEEKDAYS) if d.startswith(typed.lower()[:3]))
         return today - timedelta(days=(today.weekday() - weekday) % 7), m[1]
     if (m := _take(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2}|\d{4}))?\b", text))[0]:
         year = m[0][3] and int(m[0][3]) + (2000 if len(m[0][3]) == 2 else 0)
         return _month_day(int(m[0][2]), int(m[0][1]), year or None, today), m[1]
-    months = "|".join(MONTHS)
-    if (m := _take(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({months})[a-z]*\b", text))[0]:
-        return _month_day(MONTHS.index(m[0][2].lower()) + 1, int(m[0][1]), None, today), m[1]
-    if (m := _take(rf"\b({months})[a-z]*\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", text))[0]:
-        return _month_day(MONTHS.index(m[0][1].lower()) + 1, int(m[0][2]), None, today), m[1]
+    if (m := _take(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({MONTH_WORDS})\.?(?!\w)", text))[0]:
+        return _month_day(MONTHS.index(m[0][2].lower()[:3]) + 1, int(m[0][1]), None, today), m[1]
+    if (m := _take(rf"\b({MONTH_WORDS})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b", text))[0]:
+        return _month_day(MONTHS.index(m[0][1].lower()[:3]) + 1, int(m[0][2]), None, today), m[1]
     return today, text
 
 
@@ -379,28 +387,39 @@ def parse_quick_add(text: str, df: pd.DataFrame) -> dict:
     if found:
         currency = QUICK_CURRENCY_SYMBOLS[found[1].upper()]
     else:
-        found, rest = _take(rf"\b({'|'.join(QUICK_CURRENCY_WORDS)})\b", rest)
-        currency = QUICK_CURRENCY_WORDS[found[1].lower()] if found else ""
+        # Only next to a number ("40 pounds", "usd 40"), so "pound cake" stays a note
+        words = "|".join(QUICK_CURRENCY_WORDS)
+        found, rest = _take(rf"(?:(?<=\d)|(?<=\dk))\s*({words})\b|\b({words})\s*(?=\d)", rest)
+        currency = QUICK_CURRENCY_WORDS[(found[1] or found[2]).lower()] if found else ""
 
-    # Prefer an amount written with ₹/rs, else the first number. "1.5k" means 1500.
+    # Prefer an amount written with ₹/rs, else the biggest number ("2 pizzas 500"). "1.5k" means 1500.
     number = r"(\d[\d,]*(?:\.\d+)?)(k)?\b"
+
+    def value(digits: str, k: str | None) -> float:
+        return float(digits.replace(",", "")) * (1000 if k else 1)
+
+    amount = None
     match, rest = _take(rf"(?:₹|\brs\.?|\binr)\s*{number}", rest)
-    if not match:
-        match, rest = _take(rf"(?<![\w.#]){number}", rest)
-    amount = float(match[1].replace(",", "")) * (1000 if match[2] else 1) if match else None
+    if match:
+        amount = value(match[1], match[2])
+    elif numbers := list(re.finditer(rf"(?<![\w.#])(-?){number}", rest)):
+        match = max(numbers, key=lambda m: value(m[2], m[3]))
+        rest = rest[:match.start()] + " " + rest[match.end():]
+        amount = value(match[2], match[3]) * (-1 if match[1] else 1)  # negative is refused, not flipped
 
-    payment, rest = _take_payment(rest)
-    if payment is None:
-        # Whatever you pay with most often
-        usual = df["Payment"].mode()
-        payment = usual.iat[0] if not usual.empty else PAYMENT_METHODS[0]
-
+    # Accounts before payment words, so an account called "HDFC Card" isn't cut to "HDFC" + card
     account = ""
     for name in sorted(ACCOUNTS, key=len, reverse=True):
         found, rest = _take(rf"(?<!\w){re.escape(name)}(?!\w)", rest)
         if found:
             account = name
             break
+
+    payment, rest = _take_payment(rest)
+    if payment is None:
+        # Whatever you pay with most often
+        usual = df["Payment"].mode()
+        payment = usual.iat[0] if not usual.empty else PAYMENT_METHODS[0]
 
     category = None
     for name in sorted(CATEGORIES, key=len, reverse=True):
@@ -862,11 +881,13 @@ with st.sidebar:
     if quick.strip():
         entry = parse_quick_add(quick, df)
         rate = None
-        if entry["Currency"] and entry["Amount"] and entry["Date"]:
+        if entry["Currency"] and (entry["Amount"] or 0) > 0 and entry["Date"]:
             with st.spinner("Getting the exchange rate…"):
                 rate = exchange_rate(entry["Currency"], entry["Date"])
         if not entry["Amount"]:
             st.caption("Add an amount, like **250** or **₹1.5k**.")
+        elif entry["Amount"] < 0:
+            st.caption("Amounts can't be negative. To undo an expense, delete it in the **📋 Expenses** tab.")
         elif entry["Date"] is None:
             st.caption("That date doesn't exist. Try **5 nov** or **05/11**.")
         elif entry["Date"] > date.today():
@@ -915,7 +936,9 @@ with st.sidebar:
                 with st.popover("Text it read", width="stretch"):
                     st.code("\n".join(lines), language=None)
 
-    with st.form("add_expense", clear_on_submit=True):
+    # Not clear_on_submit: an error (no amount, no exchange rate) must keep what was typed.
+    # A successful add empties the fields itself, below.
+    with st.form("add_expense"):
         a1, a2 = st.columns([3, 2], vertical_alignment="bottom")
         amount = a1.number_input(
             "Amount", min_value=0.0, step=50.0, value=None, placeholder="e.g. 250", key="form_amount"
@@ -933,11 +956,11 @@ with st.sidebar:
         category = st.selectbox("Category", CATEGORIES, format_func=label, key="form_category")
         exp_date = st.date_input("Date", value="today", format="DD/MM/YYYY", key="form_date")
         payment = st.selectbox("Paid with", PAYMENT_METHODS, key="form_payment")
-        account = st.selectbox("From account", [NO_ACCOUNT, *ACCOUNTS]) if ACCOUNTS else NO_ACCOUNT
+        account = st.selectbox("From account", [NO_ACCOUNT, *ACCOUNTS], key="form_account") if ACCOUNTS else NO_ACCOUNT
         note = st.text_input("Note", placeholder="What was it for? Add #tags (optional)", key="form_note")
         scanned = st.session_state.get("scanned_receipt")
         receipt = st.file_uploader(
-            "Receipt (optional)", type=RECEIPT_UPLOAD_TYPES,
+            "Receipt (optional)", type=RECEIPT_UPLOAD_TYPES, key=f"form_receipt_{st.session_state.get('form_round', 0)}",
             help=f"The scanned {scanned[0]} is attached unless you choose another file." if scanned else None,
         )
         if scanned:
@@ -975,8 +998,9 @@ with st.sidebar:
             learned = learn_categories([(note, category)]) if scanned and category != scan_category else []
             # Empty the form and the scan box for the next one
             for key in ("form_amount", "form_currency", "form_rate", "form_category", "form_date", "form_payment",
-                        "form_note", "scanned_receipt", "scan_result", "scanned_id", "scan_category"):
+                        "form_note", "form_account", "scanned_receipt", "scan_result", "scanned_id", "scan_category"):
                 st.session_state.pop(key, None)
+            st.session_state["form_round"] = st.session_state.get("form_round", 0) + 1  # a new, empty receipt box
             if scanned:
                 st.session_state["scan_round"] = st.session_state.get("scan_round", 0) + 1
             flash(
@@ -1043,7 +1067,7 @@ def render_category_budgets(month_df: pd.DataFrame) -> None:
         used = cat_spent / limit
         status = "🔴" if used > 1 else "🟠" if used >= 0.8 else "🟢"
         cols[i % 2].progress(
-            min(used, 1.0),
+            min(max(used, 0.0), 1.0),  # a negative amount (only from data edited outside the app) can't crash it
             text=f"{status} {label(cat)}: {money(cat_spent)} of {money(limit)} ({used:.0%})",
         )
         if used > 1:
@@ -1074,7 +1098,8 @@ def spending_insights(month_df: pd.DataFrame, prev_df: pd.DataFrame, month: str)
         notes.append(line + ".")
 
     by_cat = month_df.groupby("Category")["Amount"].sum().sort_values(ascending=False)
-    notes.append(f"{label(by_cat.index[0])} is **{by_cat.iloc[0] / total:.0%}** of your spending.")
+    if total > 0:  # only ₹0 expenses: no shares to work out
+        notes.append(f"{label(by_cat.index[0])} is **{by_cat.iloc[0] / total:.0%}** of your spending.")
 
     biggest = month_df.loc[month_df["Amount"].idxmax()]
     note = f" ({biggest['Note']})" if biggest["Note"] else ""
@@ -1114,9 +1139,10 @@ def build_report(month: str, month_df: pd.DataFrame, month_income: float, notes:
         cards += [("Income", money(month_income)), ("Saved", f"{saved / month_income:.0%} of income")]
 
     by_cat = month_df.groupby("Category")["Amount"].sum().sort_values(ascending=False)
+    top = by_cat.iloc[0] if not by_cat.empty else 0
     cat_rows = "".join(
-        f"<tr><td>{esc(label(c))}</td><td class='num'>{money(a)}</td><td class='num'>{a / total:.0%}</td>"
-        f"<td class='bar'><span style='width:{a / by_cat.iloc[0] * 100:.0f}%'></span></td></tr>"
+        f"<tr><td>{esc(label(c))}</td><td class='num'>{money(a)}</td><td class='num'>{a / total if total else 0:.0%}</td>"
+        f"<td class='bar'><span style='width:{a / top * 100 if top else 0:.0f}%'></span></td></tr>"
         for c, a in by_cat.items()
     )
     txn_rows = "".join(
@@ -1235,7 +1261,7 @@ def render_dashboard(df: pd.DataFrame) -> None:
 
     if monthly_budget > 0:
         used = total / monthly_budget
-        st.progress(min(used, 1.0), text=f"Budget used: {used:.0%} of {money(monthly_budget)}")
+        st.progress(min(max(used, 0.0), 1.0), text=f"Budget used: {used:.0%} of {money(monthly_budget)}")
         if used > 1:
             st.warning(f"You are over budget by {money(total - monthly_budget)}.")
 
@@ -1539,8 +1565,8 @@ def render_settings(df: pd.DataFrame) -> None:
 
     if not names:
         st.error("Keep at least one category.")
-    elif len(set(names)) != len(names):
-        st.error("Category names must be unique.")
+    elif len({n.lower() for n in names}) != len(names):  # "food" next to "Food" would look like one category
+        st.error("Category names must be unique (ignoring capital letters).")
     elif blocked := [
         f"{c} ({in_use[c]} expenses)" if c in in_use else f"{c} (recurring)"
         for c in removed if c in in_use or c in in_recurring
@@ -1555,6 +1581,8 @@ def render_settings(df: pd.DataFrame) -> None:
             for rule in settings["recurring"]:
                 rule["category"] = renames.get(rule["category"], rule["category"])
             settings["category_rules"] = {w: renames.get(c, c) for w, c in settings["category_rules"].items()}
+            if settings["tax_categories"] is not None:  # None until chosen in the Year tab
+                settings["tax_categories"] = [renames.get(c, c) for c in settings["tax_categories"]]
         settings["monthly_budget"] = budget
         settings["categories"] = [
             {"name": r["name"], "icon": r["icon"].strip() or "📦", "budget": int(r["budget"])}
@@ -1934,7 +1962,10 @@ def render_recurring() -> None:
 
 # ---------- Year tab ----------
 def tax_hint(category: str) -> str:
-    return next((hint for word, hint in TAX_HINTS.items() if word in category.lower()), "")
+    # Whole words (plurals too), so "Parental care" isn't rent and "Current bills" isn't rent either
+    return next(
+        (hint for word, hint in TAX_HINTS.items() if re.search(rf"\b{word}(?:s|es)?\b", category.lower())), ""
+    )
 
 
 def save_tax_categories() -> None:
@@ -2084,7 +2115,9 @@ def render_goals() -> None:
         with st.container(border=True):
             st.markdown(f"**{goal['icon']} {goal['name']}** · {money(saved)} of {money(target)}")
             st.progress(min(max(saved / target, 0), 1.0) if target else 0.0)
-            if left == 0:
+            if not target:  # only from old or hand-edited data: the table needs a target of at least 1
+                st.markdown("Set a target for this goal in the table below.")
+            elif left == 0:
                 st.markdown("🎉 Goal reached!")
             elif goal.get("deadline"):
                 deadline = date.fromisoformat(goal["deadline"])
@@ -2111,6 +2144,8 @@ def render_goals() -> None:
             if st.form_submit_button("Save", type="primary"):
                 if not amount:
                     st.error("Enter an amount greater than 0.")
+                elif direction == "Withdraw" and amount > saved_by_goal.get(goal_name, 0.0) + 0.005:
+                    st.error(f"You can withdraw at most {money(max(saved_by_goal.get(goal_name, 0.0), 0))} from {goal_name}.")
                 else:
                     signed = amount if direction == "Add" else -amount
                     store.add("contributions", {"Date": when, "Goal": goal_name, "Amount": signed, "Note": note})
@@ -2222,6 +2257,12 @@ def render_splits() -> None:
 
     st.subheader("Balances")
     balances_by_person = open_splits.groupby("Person")["Amount"].sum().round(2)
+    # Open bills that cancel out (they owe you ₹200, you owe them ₹200) have nothing left to settle
+    if evened := sorted(balances_by_person.index[balances_by_person == 0]):
+        store.save("splits", splits.assign(
+            Settled=(splits["Settled"] | splits["Person"].isin(evened)).astype(int)
+        ))
+        flash(f"Settled up with {', '.join(evened)}: your shared bills cancel out")
     balances_by_person = balances_by_person[balances_by_person != 0]
     if balances_by_person.empty:
         st.success("All settled up 🎉")
@@ -3026,7 +3067,7 @@ def render_backups() -> None:
     st.subheader("🗄️ Backups")
     st.caption(
         "A backup is made automatically the first time you open the app each day "
-        "(the last 14 are kept). Backups are in the data/backups folder."
+        f"(the last 14 are kept). They're in the {store.backup_dir.relative_to(APP_DIR).as_posix()} folder."
     )
     b1, b2 = st.columns(2)
     if b1.button("Back up now", width="stretch"):
@@ -3041,9 +3082,12 @@ def render_backups() -> None:
     if not backups:
         return
     choice = st.selectbox("Restore from backup", backups, format_func=backup_label)
-    confirm = st.checkbox("Replace my current data with this backup (a copy of the current data is saved first)")
+    confirm = st.checkbox(
+        "Replace my current data with this backup (a copy of the current data is saved first)", key="restore_confirm"
+    )
     if st.button("♻️ Restore backup", disabled=not confirm):
         store.restore(choice)
+        st.session_state.pop("restore_confirm")  # each restore needs its own tick
         flash(f"Restored the backup from {backup_label(choice)}")
 
 
