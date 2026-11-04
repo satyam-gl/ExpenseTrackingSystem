@@ -87,7 +87,7 @@ DEFAULT_SETTINGS = {
     "assets": [],  # Things you own outside your accounts: {"name", "value", "since" (ISO date or None)}
     "fx_last": {},  # Last exchange rate fetched per currency, used when offline: code -> [date, rate]
 }
-# Shown next to tax-relevant categories in the Year tab (matched in lower case). Not tax advice.
+# Shown next to tax-relevant categories in the Year page (matched in lower case). Not tax advice.
 TAX_HINTS = {
     "rent": "HRA / 80GG",
     "health": "80D (health insurance, preventive check-ups)",
@@ -865,12 +865,13 @@ transfers = store.load("transfers")
 contributions = store.load("contributions")
 splits = store.load("splits").assign(Settled=lambda s: s["Settled"].fillna(0).astype(bool))
 
-# ---------- Sidebar: add a new expense ----------
-with st.sidebar:
-    if "toast" in st.session_state:
-        st.toast(st.session_state.pop("toast"), icon="✅")
+today = date.today()
+monthly_budget = settings["monthly_budget"]
 
-    st.header("⚡ Quick add")
+
+# ---------- Sidebar: quick add, on every page ----------
+def render_quick_add() -> None:
+    st.markdown("**⚡ Quick add**")
     quick = st.text_input(
         "Quick add", key="quick_text", label_visibility="collapsed",
         placeholder="e.g. 250 swiggy upi yesterday #goa",
@@ -887,7 +888,7 @@ with st.sidebar:
         if not entry["Amount"]:
             st.caption("Add an amount, like **250** or **₹1.5k**.")
         elif entry["Amount"] < 0:
-            st.caption("Amounts can't be negative. To undo an expense, delete it in the **📋 Expenses** tab.")
+            st.caption("Amounts can't be negative. To undo an expense, delete it on the **📋 Expenses** page.")
         elif entry["Date"] is None:
             st.caption("That date doesn't exist. Try **5 nov** or **05/11**.")
         elif entry["Date"] > date.today():
@@ -895,7 +896,7 @@ with st.sidebar:
         elif entry["Currency"] and rate is None:
             st.caption(
                 f"Couldn't get the {entry['Currency']} exchange rate (are you offline?). "
-                "Use the form below and type the rate."
+                "Use **➕ Add expense** and type the rate."
             )
         else:
             if rate:
@@ -913,10 +914,14 @@ with st.sidebar:
                 "Add", type="primary", icon=":material/add:", width="stretch",
                 on_click=quick_add, args=(entry, guess_category(entry["Note"], df)), key="quick_add",
             )
-        st.caption("Something off? Change the text or use the form below.")
+        st.caption("Something off? Change the text, or use **➕ Add expense**.")
 
-    st.header("➕ Add expense")
-    with st.expander("📷 Scan a receipt", expanded="scanned_receipt" in st.session_state):
+
+# ---------- Add expense page ----------
+def render_add_expense() -> None:
+    form_col, scan_col = st.columns([3, 2], gap="large")
+    with scan_col.container(border=True):
+        st.markdown("**📷 Scan a receipt**")
         scan = st.file_uploader(
             "Photo or PDF of a receipt", type=RECEIPT_UPLOAD_TYPES,
             key=f"scan_{st.session_state.get('scan_round', 0)}",
@@ -938,7 +943,7 @@ with st.sidebar:
 
     # Not clear_on_submit: an error (no amount, no exchange rate) must keep what was typed.
     # A successful add empties the fields itself, below.
-    with st.form("add_expense"):
+    with form_col.form("add_expense"):
         a1, a2 = st.columns([3, 2], vertical_alignment="bottom")
         amount = a1.number_input(
             "Amount", min_value=0.0, step=50.0, value=None, placeholder="e.g. 250", key="form_amount"
@@ -974,11 +979,11 @@ with st.sidebar:
         rate = (manual_rate, "") if manual_rate else exchange_rate(currency, exp_date)
     if submitted:
         if not amount:
-            st.error("Enter an amount greater than 0.")
+            form_col.error("Enter an amount greater than 0.")
         elif receipt and receipt.size > MAX_RECEIPT_MB * 1024 * 1024:
-            st.error(f"Receipts can be up to {MAX_RECEIPT_MB} MB.")
+            form_col.error(f"Receipts can be up to {MAX_RECEIPT_MB} MB.")
         elif currency != HOME_CURRENCY and rate is None:
-            st.error(
+            form_col.error(
                 f"Couldn't get the {currency} exchange rate (are you offline?). "
                 "Open **Exchange rate** in the form, type the rate and add it again."
             )
@@ -1009,10 +1014,12 @@ with st.sidebar:
                 + learned_note(learned)
             )
 
+
+
+# ---------- Sidebar: this month, bills and account, on every page ----------
+def render_sidebar_status() -> None:
     st.divider()
-    st.subheader("📅 This month")
-    today = date.today()
-    monthly_budget = settings["monthly_budget"]
+    st.markdown("**📅 This month**")
     spent_today = df.loc[df["Date"] == today, "Amount"].sum()
     this_month = pd.to_datetime(df["Date"]).dt.to_period("M") == pd.Period(today, "M")
     spent_month = df.loc[this_month, "Amount"].sum()
@@ -1027,11 +1034,11 @@ with st.sidebar:
     )
 
     if alerts := smart_alerts(df):
-        st.warning(f"🚨 {len(alerts)} alert{'s' if len(alerts) != 1 else ''}, see the Dashboard.")
+        st.page_link(DASHBOARD, label=f"{len(alerts)} alert{'s' if len(alerts) != 1 else ''} on the Dashboard", icon="🚨")
 
     if bills := upcoming_bills():
         st.divider()
-        st.subheader("🔔 Bills")
+        st.markdown("**🔔 Bills**")
         for index, rule, due in bills:
             days = (due - today).days
             when = (
@@ -1052,7 +1059,7 @@ with st.sidebar:
         st.rerun()
 
 
-# ---------- Dashboard tab ----------
+# ---------- Dashboard page ----------
 def render_category_budgets(month_df: pd.DataFrame) -> None:
     budgets = {c["name"]: c["budget"] for c in settings["categories"] if c.get("budget")}
     if not budgets:
@@ -1355,7 +1362,7 @@ def render_dashboard(df: pd.DataFrame) -> None:
         st.altair_chart(chart, width="stretch")
 
 
-# ---------- Expenses tab: edit / delete ----------
+# ---------- Expenses page: edit / delete ----------
 def reset_editor() -> None:
     # Pending table edits refer to row positions, which change when the filters do
     st.session_state.pop("editor", None)
@@ -1515,7 +1522,7 @@ def render_receipts(shown: pd.DataFrame) -> None:
             flash("Receipt saved")
 
 
-# ---------- Settings tab: budget and categories ----------
+# ---------- Settings page: budget and categories ----------
 def render_settings(df: pd.DataFrame) -> None:
     st.subheader("Monthly budget")
     budget = st.number_input(
@@ -1581,7 +1588,7 @@ def render_settings(df: pd.DataFrame) -> None:
             for rule in settings["recurring"]:
                 rule["category"] = renames.get(rule["category"], rule["category"])
             settings["category_rules"] = {w: renames.get(c, c) for w, c in settings["category_rules"].items()}
-            if settings["tax_categories"] is not None:  # None until chosen in the Year tab
+            if settings["tax_categories"] is not None:  # None until chosen in the Year page
                 settings["tax_categories"] = [renames.get(c, c) for c in settings["tax_categories"]]
         settings["monthly_budget"] = budget
         settings["categories"] = [
@@ -1619,7 +1626,7 @@ def render_learned_rules() -> None:
         flash("Learned categories saved")
 
 
-# ---------- Income tab ----------
+# ---------- Income page ----------
 def render_income(df: pd.DataFrame) -> None:
     with st.form("add_income", clear_on_submit=True):
         c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 3])
@@ -1683,7 +1690,7 @@ def render_income(df: pd.DataFrame) -> None:
         flash("Income saved")
 
 
-# ---------- Import tab ----------
+# ---------- Import page ----------
 def parse_amount(text) -> float | None:
     """'₹1,250.00', 'Rs. 500', '-40', '300 Dr', '1,250.00-', '(250.00)' -> numbers. Dr and a minus or brackets
     mean money out (negative), Cr means money in. None if it isn't an amount."""
@@ -1848,7 +1855,7 @@ def render_import(df: pd.DataFrame) -> None:
         flash(f"Imported {len(chosen)} expenses" + learned_note(learned))
 
 
-# ---------- Recurring tab ----------
+# ---------- Recurring page ----------
 def render_subscriptions(df: pd.DataFrame) -> None:
     found = find_subscriptions(df)
     if not found:
@@ -1960,7 +1967,7 @@ def render_recurring() -> None:
     flash("Recurring expenses saved")
 
 
-# ---------- Year tab ----------
+# ---------- Year page ----------
 def tax_hint(category: str) -> str:
     # Whole words (plurals too), so "Parental care" isn't rent and "Current bills" isn't rent either
     return next(
@@ -2097,7 +2104,7 @@ def render_year(df: pd.DataFrame) -> None:
     )
 
 
-# ---------- Goals tab ----------
+# ---------- Goals page ----------
 def months_until(deadline: date) -> int:
     """Whole months left to save, counting the current one."""
     today = date.today()
@@ -2199,7 +2206,7 @@ def render_goals() -> None:
     flash("Goals saved")
 
 
-# ---------- Splits tab ----------
+# ---------- Splits page ----------
 def split_people(text: str) -> list[str]:
     """'rahul, Priya ,,' -> ['Rahul', 'Priya'] (no duplicates, 'me' left out)"""
     names = [n.strip().title() for n in text.split(",")]
@@ -2300,7 +2307,7 @@ def render_splits() -> None:
         flash("Shared bills saved")
 
 
-# ---------- Accounts tab ----------
+# ---------- Accounts page ----------
 def balances(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for acc in settings["accounts"]:
@@ -2606,7 +2613,7 @@ def render_accounts(df: pd.DataFrame) -> None:
         flash("Accounts saved")
 
 
-# ---------- Loans tab ----------
+# ---------- Loans page ----------
 LOAN_TYPES = {"Home": "🏠", "Car": "🚗", "Personal": "👤", "Education": "🎓", "Credit card": "💳", "Gold": "🪙",
               "Other": "📄"}
 MAX_LOAN_MONTHS = 600  # 50 years; a schedule longer than this is treated as never paid off
@@ -2900,7 +2907,7 @@ def render_loans() -> None:
         flash("Loans saved")
 
 
-# ---------- Net worth (Accounts tab) ----------
+# ---------- Net worth (Accounts page) ----------
 NET_WORTH_MONTHS = 60  # How far back the history goes
 
 
@@ -3037,7 +3044,7 @@ def render_net_worth(df: pd.DataFrame) -> None:
                 flash("Assets saved")
 
 
-# ---------- Settings tab: backups ----------
+# ---------- Settings page: backups ----------
 def backup_label(path: Path) -> str:
     # File names look like expenses_2026-10-30_101500_auto.db
     _, day, clock, *kind = path.stem.split("_")
@@ -3091,37 +3098,49 @@ def render_backups() -> None:
         flash(f"Restored the backup from {backup_label(choice)}")
 
 
-# ---------- Main page ----------
-st.title("💰 Expense Tracker")
-
-(tab_dash, tab_year, tab_expenses, tab_income, tab_goals, tab_splits, tab_accounts, tab_loans, tab_recurring,
- tab_import, tab_settings) = st.tabs([
-    "📊 Dashboard", "📅 Year", "📋 Expenses", "💵 Income", "🎯 Goals", "🤝 Splits", "🏦 Accounts", "🏛️ Loans",
-    "🔁 Recurring", "📥 Import", "⚙️ Settings",
-])
-with tab_dash:
-    render_dashboard(df)
-with tab_year:
-    render_year(df)
-with tab_expenses:
-    render_expenses(df)
-with tab_income:
-    render_income(df)
-with tab_goals:
-    render_goals()
-with tab_splits:
-    render_splits()
-with tab_accounts:
-    render_accounts(df)
-with tab_loans:
-    render_loans()
-with tab_import:
-    render_import(df)
-with tab_recurring:
+# ---------- Pages, in the sidebar ----------
+def render_recurring_page() -> None:
     render_subscriptions(df)
     render_recurring()
-with tab_settings:
+
+
+def render_settings_page() -> None:
     render_settings(df)
     render_learned_rules()
     render_backups()
     render_account()
+
+
+# Only the open page runs, so each click builds one page instead of all of them
+DASHBOARD = st.Page(lambda: render_dashboard(df), title="Dashboard", icon="📊", url_path="dashboard", default=True)
+page = st.navigation({
+    "Overview": [
+        DASHBOARD,
+        st.Page(lambda: render_year(df), title="Year", icon="📅", url_path="year"),
+    ],
+    "Money": [
+        st.Page(render_add_expense, title="Add expense", icon="➕", url_path="add"),
+        st.Page(lambda: render_expenses(df), title="Expenses", icon="📋", url_path="expenses"),
+        st.Page(lambda: render_income(df), title="Income", icon="💵", url_path="income"),
+        st.Page(lambda: render_accounts(df), title="Accounts", icon="🏦", url_path="accounts"),
+        st.Page(render_loans, title="Loans", icon="🏛️", url_path="loans"),
+    ],
+    "Planning": [
+        st.Page(render_goals, title="Goals", icon="🎯", url_path="goals"),
+        st.Page(render_recurring_page, title="Recurring", icon="🔁", url_path="recurring"),
+        st.Page(render_splits, title="Splits", icon="🤝", url_path="splits"),
+    ],
+    "Tools": [
+        st.Page(lambda: render_import(df), title="Import", icon="📥", url_path="import"),
+        st.Page(render_settings_page, title="Settings", icon="⚙️", url_path="settings"),
+    ],
+})
+
+if "toast" in st.session_state:
+    st.toast(st.session_state.pop("toast"), icon="✅")
+with st.sidebar:
+    render_quick_add()
+    render_sidebar_status()
+
+st.title(f"{page.icon} {page.title}")
+page.run()
